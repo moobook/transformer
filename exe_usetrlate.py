@@ -1,0 +1,372 @@
+import os
+# import pdb
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+import transformer.Constants as Constants
+from transformer.Models import Transformer, get_pad_mask, get_subsequent_mask
+from transformer.Optim import ScheduledOptim
+from transformer.Translator import Translator
+
+
+TEST_SOURCE_PATH = os.environ['HOME'] + "/seq2seq/corpus.tok/dev.en"
+TEST_TARGET_PATH = os.environ['HOME'] + "/seq2seq/corpus.tok/dev.ja"
+TR_SOURCE_PATH = os.environ['HOME'] + "/seq2seq/corpus.tok/ult_train.en"
+TR_TARGET_PATH = os.environ['HOME'] + "/seq2seq/corpus.tok/ult_train.ja"
+BATCHSIZE = 50
+HIDDEN_SIZE = 512
+D_INNER = 2048
+N_LAYERS = 6
+DROPOUT = 0.1
+N_HEAD = 8
+D_K = 64
+D_V = 64
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+EPOCH = 20
+MODEL = "transformer20_2.model"
+N_POSITION = 200
+MAX_SEQ_LEN = 100
+
+
+# 辞書を作成
+def gene_dict(path):
+    diction = {Constants.PAD_WORD: 0,
+               Constants.BOS_WORD: 1,
+               Constants.EOS_WORD: 2,
+               Constants.UNK_WORD: 3}
+    i = 4
+    with open(path) as f:
+        for s in f.readlines():
+            for word in s.split():
+                if word not in diction:
+                    diction[word] = i
+                    i += 1
+    return diction
+
+
+def gene_revdict(diction):
+    rev_dict = {}
+    for key, value in diction.items():
+        rev_dict[value] = key
+
+    return rev_dict
+
+
+# 数値に変換したデータを作成
+def gene_data(path, diction):
+    # データはlistのまま処理してtensorにする
+    word_list = list()
+    max_len = 0
+    with open(path) as f:
+        for s in f.readlines():
+            a = list(map(lambda x: diction[x] if x in diction else diction[Constants.UNK_WORD], s.split()))
+            length = len(a)
+            if max_len < length:
+                if max_len == 0:
+                    max_len = length
+                else:
+                    for i in range(length - max_len):
+                        word_list = list(map(lambda x: x + [diction[Constants.PAD_WORD]], word_list))
+                    max_len = length
+            elif max_len > length:
+                for i in range(max_len - length):
+                    a.append(diction[Constants.PAD_WORD])
+            word_list.append(a)
+
+    return word_list
+
+
+def gene_trg_data(path, diction):
+    # データはlistのまま処理してtensorにする
+    word_list = list()
+    max_len = 0
+    with open(path) as f:
+        for s in f.readlines():
+            a = list(map(lambda x: diction[x] if x in diction else diction[Constants.UNK_WORD], s.split()))
+            a = a + [diction[Constants.EOS_WORD]]
+            length = len(a)
+            if max_len < length:
+                if max_len == 0:
+                    max_len = length
+                else:
+                    for i in range(length - max_len):
+                        word_list = list(map(lambda x: x + [diction[Constants.PAD_WORD]], word_list))
+                    max_len = length
+            elif max_len > length:
+                for i in range(max_len - length):
+                    a.append(diction[Constants.PAD_WORD])
+            word_list.append(a)
+
+    return word_list
+
+
+# datasetを作成するクラス
+class Mydatasets(torch.utils.data.Dataset):
+    def __init__(self,  data_dict, label_dict, data_path, label_path):
+
+        self.data = gene_data(data_path, data_dict)
+        self.data = torch.tensor(self.data)
+
+        self.label = gene_trg_data(label_path, label_dict)
+        self.label = torch.tensor(self.label)
+
+        self.datanum = len(self.data)
+
+    def __len__(self):
+        return self.datanum
+
+    def __getitem__(self, idx):
+        out_data = self.data[idx]
+        out_label = self.label[idx]
+        return out_data, out_label
+
+
+def make_loader(train_dataset, test_dataset):
+    train_loader = DataLoader(
+        dataset=train_dataset,  # データセットの指定
+        batch_size=BATCHSIZE,  # ミニバッチの指定
+        shuffle=True)  # シャッフルするかどうかの指定
+
+    test_loader = DataLoader(
+        dataset=test_dataset,  # データセットの指定
+        batch_size=BATCHSIZE,  # ミニバッチの指定
+        shuffle=False)  # シャッフルするかどうかの指定
+
+    return train_loader, test_loader
+
+
+def train(
+        train_loader,
+        src_vocab_size, trg_vocab_size,
+        src_pad_idx, trg_pad_idx,
+        trg_bos_idx, trg_eos_idx):
+
+    proj_share_weight = True
+    embs_share_weight = True
+
+    transformer = Transformer(
+        src_vocab_size,
+        trg_vocab_size,
+        src_pad_idx=src_pad_idx,
+        trg_pad_idx=trg_pad_idx,
+        trg_emb_prj_weight_sharing=proj_share_weight,
+        emb_src_trg_weight_sharing=embs_share_weight,
+        d_k=D_K,
+        d_v=D_V,
+        d_model=HIDDEN_SIZE,
+        d_word_vec=HIDDEN_SIZE,
+        d_inner=D_INNER,
+        n_layers=N_LAYERS,
+        n_head=N_HEAD,
+        dropout=DROPOUT).to(DEVICE)
+    
+    d_model = HIDDEN_SIZE
+    n_warmup_steps = 4000
+    optimizer = ScheduledOptim(
+        optim.Adam(transformer.parameters(), betas=(0.9, 0.98), eps=1e-09),
+        1.0, d_model, n_warmup_steps)
+
+    detail_train(transformer, train_loader, optimizer,
+                 trg_bos_idx, trg_eos_idx, trg_pad_idx)
+    
+
+def detail_train(model, training_data, optimizer,
+                 trg_bos_idx, trg_eos_idx, trg_pad_idx):
+    label_smoothing = True
+    for epoch in range(EPOCH):
+        total_loss, train_loss, train_accu = train_epoch(
+            model, training_data, optimizer,
+            trg_bos_idx, trg_eos_idx, trg_pad_idx, smoothing=label_smoothing)
+        print("epoch", epoch, ": loss", total_loss)
+        print("train_loss: ", train_loss, "train_accu: ", train_accu)
+        torch.save(model.state_dict(), MODEL)
+
+
+def gene_trg_golseq(trg_seq, trg_bos_idx, trg_eos_idx, trg_pad_idx):
+    gold = trg_seq
+    bos = torch.tensor([], dtype=torch.long)
+    bos = bos.new_full((trg_seq.size(0), 1), trg_bos_idx)
+    trg_seq = torch.cat([bos, gold], dim=1)
+    trg_seq[trg_seq == trg_eos_idx] = trg_pad_idx
+    trg_seq = trg_seq[:, :trg_seq.size(1)-1]
+    return gold, trg_seq
+
+
+def cal_performance(pred, gold, trg_pad_idx, smoothing=False):
+    ''' Apply label smoothing if needed '''
+
+    loss = cal_loss(pred, gold, trg_pad_idx, smoothing=smoothing)
+
+    pred = pred.max(1)[1]
+    gold = gold.contiguous().view(-1)
+    non_pad_mask = gold.ne(trg_pad_idx)
+    n_correct = pred.eq(gold).masked_select(non_pad_mask).sum().item()
+    n_word = non_pad_mask.sum().item()
+
+    return loss, n_correct, n_word
+
+
+def cal_loss(pred, gold, trg_pad_idx, smoothing=False):
+    ''' Calculate cross entropy loss, apply label smoothing if needed. '''
+
+    gold = gold.contiguous().view(-1)
+
+    if smoothing:
+        eps = 0.1
+        n_class = pred.size(1)
+
+        one_hot = torch.zeros_like(pred).scatter(1, gold.view(-1, 1), 1)
+        one_hot = one_hot * (1 - eps) + (1 - one_hot) * eps / (n_class - 1)
+        log_prb = F.log_softmax(pred, dim=1)
+
+        non_pad_mask = gold.ne(trg_pad_idx)
+        loss = -(one_hot * log_prb).sum(dim=1)
+        loss = loss.masked_select(non_pad_mask).sum()  # average later
+    else:
+        loss = F.cross_entropy(pred, gold,
+                               ignore_index=trg_pad_idx, reduction='sum')
+    return loss
+
+
+def train_epoch(model, training_data, optimizer,
+                trg_bos_idx, trg_eos_idx, trg_pad_idx, smoothing):
+    ''' Epoch operation in training phase'''
+
+    model.train()
+    total_loss, n_word_total, n_word_correct = 0, 0, 0
+
+    # desc = '  - (Training)   '
+    # for batch in tqdm(training_data, mininterval=2, desc=desc, leave=False):
+    for src_seq, trg_seq in training_data:
+
+        # prepare data
+        # src_seq = patch_src(batch.src, opt.src_pad_idx).to(device)
+        # trg_seq, gold = map(lambda x: x.to(device), patch_trg(batch.trg, opt.trg_pad_idx))
+        
+        src_seq = src_seq.to(DEVICE)
+        gold, trg_seq = gene_trg_golseq(trg_seq, trg_bos_idx, trg_eos_idx, trg_pad_idx)
+        trg_seq, gold = map(lambda x: x.to(DEVICE), (trg_seq, gold))
+        
+        # forward
+        optimizer.zero_grad()
+        pred = model(src_seq, trg_seq)
+        
+        # backward and update parameters
+        loss, n_correct, n_word = cal_performance(
+            pred, gold, trg_pad_idx, smoothing=smoothing)
+        loss.backward()
+        optimizer.step_and_update_lr()
+        
+        # note keeping
+        
+        n_word_total += n_word
+        n_word_correct += n_correct
+        total_loss += loss.item()
+    loss_per_word = total_loss/n_word_total
+    accuracy = n_word_correct/n_word_total
+        
+    return total_loss, loss_per_word, accuracy
+
+
+def output(pred, trg_rev_dict):
+    for x in pred:
+        if trg_rev_dict[x] == Constants.EOS_WORD:
+            break
+        if trg_rev_dict[x] == Constants.BOS_WORD:
+            continue
+        print(trg_rev_dict[x], end=' ')
+    print("\n", end='')
+
+
+def test(
+        test_loader,
+        src_vocab_size, trg_vocab_size,
+        src_pad_idx, trg_pad_idx,
+        trg_bos_idx, trg_eos_idx,
+        trg_rev_dict):
+    
+    model = Transformer(
+        src_vocab_size,
+        trg_vocab_size,
+        src_pad_idx,
+        trg_pad_idx,
+        d_word_vec=HIDDEN_SIZE,
+        d_model=HIDDEN_SIZE,
+        d_inner=D_INNER,
+        n_layers=N_LAYERS,
+        n_head=N_HEAD,
+        d_k=D_K,
+        d_v=D_V,
+        dropout=DROPOUT,
+        n_position=N_POSITION).to(DEVICE)
+
+    model.load_state_dict(torch.load(MODEL))
+    model.eval()
+    beam_size = 5
+    # print(model.encoder.layer_stack[0].slf_attn.w_qs.weight)
+    translator = Translator(
+        model=model,
+        beam_size=beam_size,
+        max_seq_len=MAX_SEQ_LEN,
+        src_pad_idx=src_pad_idx,
+        trg_pad_idx=trg_pad_idx,
+        trg_bos_idx=trg_bos_idx,
+        trg_eos_idx=trg_eos_idx).to(DEVICE)
+
+    # unk_idx = SRC.vocab.stoi[SRC.unk_token]
+    for example in tqdm(test_loader, mininterval=2, desc='  - (Test)', leave=False):
+        # print(' '.join(example.src))
+        # pdb.set_trace()
+        for word in example[0]:
+            src_seq = word.unsqueeze(0).to(DEVICE)
+            pred_seq = translator.translate_sentence(src_seq)
+            # pdb.set_trace()
+            output(pred_seq, trg_rev_dict)
+        
+
+def main():
+    # 辞書作成
+    src_dict = gene_dict(TR_SOURCE_PATH)
+    trg_dict = gene_dict(TR_TARGET_PATH)
+    
+    # 逆の辞書を作る
+    trg_rev_dict = gene_revdict(trg_dict)
+    # src_rev_dict = gene_revdict(src_dict)
+    
+    train_dataset = Mydatasets(src_dict, trg_dict, TR_SOURCE_PATH, TR_TARGET_PATH)
+    test_dataset = Mydatasets(src_dict, trg_dict, TEST_SOURCE_PATH, TEST_TARGET_PATH)
+    
+    train_loader, test_loader = make_loader(train_dataset, test_dataset)
+    '''
+    for src_seq, trg_seq in train_loader:
+        output(src_seq, src_rev_dict)
+        print("ここまでが原言語")
+        output(trg_seq, trg_rev_dict)
+        # exit()
+    '''
+    '''
+    train(train_loader,
+          len(src_dict),
+          len(trg_dict),
+          src_dict[Constants.PAD_WORD],
+          trg_dict[Constants.PAD_WORD],
+          trg_dict[Constants.BOS_WORD],
+          trg_dict[Constants.EOS_WORD])
+    '''
+    print("ここからsave&load")
+    test(test_loader,
+         len(src_dict),
+         len(trg_dict),
+         src_dict[Constants.PAD_WORD],
+         trg_dict[Constants.PAD_WORD],
+         trg_dict[Constants.BOS_WORD],
+         trg_dict[Constants.EOS_WORD],
+         trg_rev_dict)
+
+
+if __name__ == '__main__':
+    main()
