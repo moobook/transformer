@@ -27,7 +27,7 @@ D_K = 64
 D_V = 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPOCH = 20
-MODEL = "transformer20_2.model"
+MODEL = "transformer.model"
 N_POSITION = 200
 MAX_SEQ_LEN = 100
 

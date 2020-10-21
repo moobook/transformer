@@ -1,5 +1,5 @@
 import os
-# import pdb
+import pdb
 import nltk
 import torch
 import torch.nn as nn
@@ -11,6 +11,7 @@ import transformer.Constants as Constants
 from transformer.Models import Transformer, get_pad_mask, get_subsequent_mask
 from transformer.Optim import ScheduledOptim
 
+BLEU_SCORE_PATH = './bleu100K.txt'
 TEST_SOURCE_PATH = os.environ['HOME'] + "/seq2seq/corpus.tok/dev.en"
 TEST_TARGET_PATH = os.environ['HOME'] + "/seq2seq/corpus.tok/dev.ja"
 TR_SOURCE_PATH = os.environ['HOME'] + "/seq2seq/corpus.tok/ult_train.en"
@@ -29,6 +30,28 @@ MODEL = "transformer20_100K.model"
 N_POSITION = 200
 MAX_SEQ_LEN = 100
 
+def dict_cutdown(path, diction_cut):
+
+    diction = {}
+    with open(path) as f:
+        for s in f.readlines():
+            for word in s.split():
+                if word not in diction:
+                    diction[word] = 1
+                else:
+                    diction[word] = int(diction[word])+1
+                 
+    vocab_size = 10000
+    cut_cnt_num = 2
+    while True:
+        for key, value in diction.items():
+            if int(float(value)) < cut_cnt_num and key in diction_cut:
+                # pdb.set_trace()
+                del diction_cut[key]
+                if vocab_size == len(diction_cut):
+                    return diction_cut
+        cut_cnt_num += 1
+
 
 # 辞書を作成
 def gene_dict(path):
@@ -45,6 +68,15 @@ def gene_dict(path):
                     i += 1
     return diction
 
+
+def regene_dict(diction):
+
+    rediction = {}
+    i = 0
+    for key, value in diction.items():
+        rediction[key] = i
+        i += 1
+    return rediction
 
 def gene_revdict(diction):
     rev_dict = {}
@@ -186,7 +218,8 @@ def detail_train(model, training_data, test_loader, src_vocab_size, trg_vocab_si
         print("epoch", epoch, ": loss", total_loss)
         print("train_loss: ", train_loss, "train_accu: ", train_accu)
         torch.save(model.state_dict(), MODEL)
-        test(test_loader,
+        test(str(epoch),
+             test_loader,
              src_vocab_size, trg_vocab_size,
              src_pad_idx,
              trg_pad_idx,
@@ -281,7 +314,7 @@ def train_epoch(model, training_data, optimizer,
     return total_loss, loss_per_word, accuracy
 
 
-def output(pred, trg_rev_dict):
+def output_pnt(pred, trg_rev_dict):
     for xs in pred:
         for x in xs:
             if trg_rev_dict[x.item()] == Constants.EOS_WORD:
@@ -292,13 +325,13 @@ def output(pred, trg_rev_dict):
         print("\n", end='')
 
 
-def test(
-        test_loader,
-        src_vocab_size, trg_vocab_size,
-        src_pad_idx, trg_pad_idx,
-        trg_bos_idx, trg_eos_idx,
-        trg_rev_dict,
-        output=False):
+def test(str_epoch,
+         test_loader,
+         src_vocab_size, trg_vocab_size,
+         src_pad_idx, trg_pad_idx,
+         trg_bos_idx, trg_eos_idx,
+         trg_rev_dict,
+         output=False):
     
     model = Transformer(
         src_vocab_size,
@@ -325,28 +358,22 @@ def test(
         result_tensor = a.new_full((src_seq.size(0), 1), trg_bos_idx).to(DEVICE)
         src_seq = src_seq.to(DEVICE)
         src_mask = get_pad_mask(src_seq, src_pad_idx)
-        # print("Last_enc")
-        # print(enc_output)
         enc_output, *_ = model.encoder(src_seq, src_mask)
-        # print("Another_enc")
-        # print(enc_output)
-        # enc_output2, *_ = model.encoder(src_seq2, src_mask2)
-        # enc_output3, *_ = model.encoder(src_seq3, src_mask3)
         for token in range(MAX_SEQ_LEN):
             trg_mask = get_subsequent_mask(result_tensor)
             dec_output, *_ = model.decoder(result_tensor, trg_mask, enc_output, src_mask)
             y = F.softmax(model.trg_word_prj(dec_output), dim=-1)
 
-            # y(batch_size x word_len x dict_size)
             pred_labels = y[:, -1, :].topk(1)[1]
             result_tensor = torch.cat((result_tensor, pred_labels), dim=1)
         if output :
-            output(result_tensor[:, 1:], trg_rev_dict)
+            # pdb.set_trace()
+            output_pnt(result_tensor[:, 1:], trg_rev_dict)
         else:
             hyp_sentence_to_list(hypothesis, result_tensor[:, 1:], trg_rev_dict)
     if not output:
         reference = gene_ref(TEST_TARGET_PATH)
-        bleu(reference, hypothesis)
+        bleu(str_epoch, reference, hypothesis)
  
 
 def hyp_sentence_to_list(hypothesis, pred, trg_rev_dict):
@@ -362,14 +389,14 @@ def hyp_sentence_to_list(hypothesis, pred, trg_rev_dict):
         hypothesis.append(sentence)
 
 
-def bleu(reference, hypothesis):
+def bleu(str_epoch, reference, hypothesis):
     # hypothesis = [['It', 'is', 'a', 'cat', 'at', 'room'], ['It', 'is', 'an', 'apple']]
     # reference = [[['It', 'is', 'a', 'cat', 'inside', 'the', 'room']], [['It', 'is', 'a', 'pen']]]
     # there may be several references
     BLEUscore = nltk.translate.bleu_score.corpus_bleu(reference, hypothesis)
-    path_w = './bleu100K.txt'
-    with open(path_w, mode='w') as f:
-        f.write(str(BLEUscore*100))
+    path_w = BLEU_SCORE_PATH
+    with open(path_w, mode='a') as f:
+        f.write(str_epoch +':'+ str(BLEUscore*100) + '\n')
 
 
 def gene_ref(path):
@@ -386,8 +413,12 @@ def gene_ref(path):
 def main():
     # 辞書作成
     src_dict = gene_dict(TR_SOURCE_PATH)
+    src_dict = dict_cutdown(TR_SOURCE_PATH, src_dict)
+    src_dict = regene_dict(src_dict)
+
     trg_dict = gene_dict(TR_TARGET_PATH)
-    
+    trg_dict = dict_cutdown(TR_TARGET_PATH, trg_dict)
+    trg_dict = regene_dict(trg_dict)
     # 逆の辞書を作る
     trg_rev_dict = gene_revdict(trg_dict)
     # src_rev_dict = gene_revdict(src_dict)
@@ -412,10 +443,9 @@ def main():
           trg_dict[Constants.BOS_WORD],
           trg_dict[Constants.EOS_WORD],
           trg_rev_dict)
-    
-    # print("ここからsave&load")
-    
-    test(test_loader,
+        
+    test('test',
+         test_loader,
          len(src_dict),
          len(trg_dict),
          src_dict[Constants.PAD_WORD],
